@@ -1,0 +1,262 @@
+name: Fetch(bible) ➜ Journaling PDF (links preserved)
+
+on:
+  workflow_dispatch:
+    inputs:
+      bible_id:
+        description: "Bible ID from fetch.bible (use eng_bsb for Berean Standard Bible)"
+        required: true
+        default: eng_bsb
+      books:
+        description: "Optional: comma list of book codes (e.g., gen,exo,psa,mat,…). Leave blank for all."
+        required: false
+        default: ""
+      theme:
+        description: "light or dark"
+        required: false
+        default: "light"
+      pagesize:
+        description: "letter-landscape or a4-landscape"
+        required: false
+        default: "letter-landscape"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node (for fetching/building HTML)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Set up Python (for WeasyPrint)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: System deps for WeasyPrint
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -yqq \
+            build-essential libcairo2 libpango-1.0-0 libgdk-pixbuf2.0-0 \
+            libffi-dev shared-mime-info fonts-dejavu-core
+
+      - name: Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install weasyprint
+
+      - name: Write builder.mjs (pulls BSB HTML JSON ➜ makes one HTML with TOC + journaling layout)
+        run: |
+          cat > builder.mjs <<'EOF'
+          import fs from "node:fs/promises";
+
+          const args = Object.fromEntries(process.argv.slice(2).map(s=>{
+            const [k,...rest]=s.split("=");
+            return [k.replace(/^--/,""), rest.join("=")];
+          }));
+          const BIBLE_ID = args.bible || process.env.BIBLE_ID || "eng_bsb";
+          const ONLY = (args.books||"").trim()
+            ? args.books.split(",").map(s=>s.trim()).filter(Boolean)
+            : null;
+          const THEME = (args.theme||"light").toLowerCase();
+          const PAGESIZE = (args.pagesize||"letter-landscape").toLowerCase();
+
+          const BASE = `https://v1.fetch.bible/bibles/${BIBLE_ID}/html`;
+
+          // Canonical order & codes used by fetch.bible
+          const ORDER = [
+            "gen","exo","lev","num","deu","jos","jdg","rut","1sa","2sa","1ki","2ki","1ch","2ch","ezr","neh","est",
+            "job","psa","pro","ecc","sng","isa","jer","lam","ezk","dan","hos","jol","amo","oba","jon","mic","nam","hab","zep","hag","zec","mal",
+            "mat","mrk","luk","jhn","act","rom","1co","2co","gal","eph","php","col","1th","2th","1ti","2ti","tit","phm","heb","jas","1pe","2pe","1jn","2jn","3jn","jud","rev"
+          ];
+          const NAMES = {
+            gen:"Genesis", exo:"Exodus", lev:"Leviticus", num:"Numbers", deu:"Deuteronomy", jos:"Joshua", jdg:"Judges", rut:"Ruth",
+            "1sa":"1 Samuel","2sa":"2 Samuel","1ki":"1 Kings","2ki":"2 Kings","1ch":"1 Chronicles","2ch":"2 Chronicles","ezr":"Ezra","neh":"Nehemiah","est":"Esther",
+            job:"Job", psa:"Psalms", pro:"Proverbs", ecc:"Ecclesiastes", sng:"Song of Songs", isa:"Isaiah", jer:"Jeremiah", lam:"Lamentations",
+            ezk:"Ezekiel", dan:"Daniel", hos:"Hosea", jol:"Joel", amo:"Amos", oba:"Obadiah", jon:"Jonah", mic:"Micah", nam:"Nahum", hab:"Habakkuk", zep:"Zephaniah",
+            hag:"Haggai", zec:"Zechariah", mal:"Malachi",
+            mat:"Matthew", mrk:"Mark", luk:"Luke", jhn:"John", act:"Acts", rom:"Romans", "1co":"1 Corinthians","2co":"2 Corinthians",
+            gal:"Galatians", eph:"Ephesians", php:"Philippians", col:"Colossians", "1th":"1 Thessalonians","2th":"2 Thessalonians",
+            "1ti":"1 Timothy","2ti":"2 Timothy", tit:"Titus", phm:"Philemon", heb:"Hebrews", jas:"James",
+            "1pe":"1 Peter","2pe":"2 Peter","1jn":"1 John","2jn":"2 John","3jn":"3 John", jud:"Jude", rev:"Revelation"
+          };
+
+          const pick = ONLY ? ORDER.filter(c=>ONLY.includes(c)) : ORDER;
+
+          // Fetch utility with retries
+          async function getJSON(url, tries=5){
+            for (let i=1;i<=tries;i++){
+              const r = await fetch(url);
+              if (r.ok) return await r.json();
+              if (r.status===404) throw new Error(`404 Not Found: ${url}`);
+              await new Promise(res=>setTimeout(res, 500*i));
+            }
+            throw new Error(`Failed to fetch ${url}`);
+          }
+
+          // Flatten whatever JSON structure into one HTML string, per chapter
+          function extractChapters(json){
+            // Common shapes: {chapters:[...]} OR {"1":[...], "2":[...]} OR {chapters:{"1":[...]}}
+            let root = json.chapters ?? json;
+
+            const byChapter = new Map();
+
+            const flatten = (node, out) => {
+              if (node==null) return;
+              if (typeof node==="string") { out.push(node); return; }
+              if (Array.isArray(node)) { node.forEach(n=>flatten(n,out)); return; }
+              if (typeof node==="object") {
+                // prefer .html or .content if present
+                if (typeof node.html==="string") out.push(node.html);
+                else if (typeof node.content==="string") out.push(node.content);
+                else Object.values(node).forEach(n=>flatten(n,out));
+                return;
+              }
+            };
+
+            // object with numeric keys?
+            if (root && !Array.isArray(root) && typeof root==="object"){
+              for (const k of Object.keys(root).sort((a,b)=>Number(a)-Number(b))){
+                const bucket = [];
+                flatten(root[k], bucket);
+                byChapter.set(Number(k), bucket.join(""));
+              }
+              return byChapter;
+            }
+
+            // array of chapter-like items (look for .c / .chapter number)
+            if (Array.isArray(root)){
+              let idx=0;
+              for (const item of root){
+                const n = Number(item?.c ?? item?.chapter ?? ++idx);
+                const bucket=[];
+                flatten(item, bucket);
+                byChapter.set(n, bucket.join(""));
+              }
+              return byChapter;
+            }
+
+            // fallback: treat the whole thing as chapter 1
+            const bucket=[];
+            flatten(root, bucket);
+            byChapter.set(1, bucket.join(""));
+            return byChapter;
+          }
+
+          // Build HTML
+          let cssPage = "@page { size: 11in 8.5in; margin: 0.5in; }";
+          if (PAGESIZE==="a4-landscape") cssPage = "@page { size: 297mm 210mm; margin: 12mm; }";
+
+          const css = `
+          :root{
+            --ink: ${THEME==="dark" ? "#eaeef2" : "#111"};
+            --muted: ${THEME==="dark" ? "#9fb3c8" : "#666"};
+            --rule: ${THEME==="dark" ? "#2b3947" : "#d9dee3"};
+            --bg: ${THEME==="dark" ? "#0f1720" : "white"};
+          }
+          ${cssPage}
+          html, body { background: var(--bg); color: var(--ink); font-family: system-ui, -apple-system, Segoe UI, Roboto, "DejaVu Sans", Helvetica, Arial, sans-serif; }
+          a { color: inherit; text-decoration: underline; }
+          h1,h2,h3 { margin: 0 0 .2rem 0; }
+          .toc { column-count: 4; column-gap: 1.25rem; font-size: .92rem; }
+          .toc a{ text-decoration: none; }
+          .grid { display: grid; grid-template-columns: repeat(10, 1fr); gap: .25rem; font-size: .85rem; }
+          .grid a{ display:inline-block; padding:.25rem .35rem; border:1px solid var(--rule); border-radius:.25rem; text-decoration:none; }
+          .page { page-break-after: always; }
+          .spread { display:grid; grid-template-columns: 68% 0 32%; column-gap:.35in; align-items:start; }
+          .divider { border-left:1px solid var(--rule); height: 100%; }
+          .left { line-height: 1.45; }
+          .hdr { display:flex; justify-content:space-between; align-items:baseline; color: var(--muted); margin-bottom:.25rem; font-size:.85rem; }
+          .hdr .book { font-weight:600; color:var(--ink); font-size: 1rem; }
+          .corner { position: relative; }
+          .corner a{ text-decoration:none; color:var(--muted); font-size:.8rem; }
+          .notes { color: var(--muted); }
+          .notes:after{ content:""; display:block; height: 100%; }
+          /* keep any existing superscripts small */
+          sup { font-size: 65%; vertical-align: super; }
+          /* ensure footnotes/cross-refs anchors remain clickable */
+          [id] { scroll-margin-top: 0.5in; }
+          `;
+
+          let html = [];
+          html.push(`<!doctype html><html><head><meta charset="utf-8"><title>Journaling Bible (fetch.bible)</title><style>${css}</style></head><body>`);
+
+          // Title + TOC
+          html.push(`<section class="page"><h1>Holy Bible — Journaling Edition</h1><div class="toc">`);
+          for (const code of pick){
+            html.push(`<div><a href="#grid-${code}">${NAMES[code]||code}</a></div>`);
+          }
+          html.push(`</div></section>`);
+
+          for (const code of pick){
+            const url = `${BASE}/${code}.json`;
+            const data = await getJSON(url);
+            const chapters = extractChapters(data); // Map<number,string>
+
+            // Book chapter grid
+            html.push(`<section class="page" id="book-${code}">
+              <div class="hdr">
+                <div class="corner"><a href="#toc">Home</a></div>
+                <div class="book">${NAMES[code]||code}</div>
+                <div class="corner"></div>
+              </div>
+              <h2 id="grid-${code}">${NAMES[code]||code}</h2>
+              <div class="grid">`);
+
+            for (const n of Array.from(chapters.keys()).sort((a,b)=>a-b)){
+              html.push(`<a href="#${code}-${n}">${n}</a>`);
+            }
+            html.push(`</div></section>`);
+
+            // Chapter pages
+            for (const n of Array.from(chapters.keys()).sort((a,b)=>a-b)){
+              const chapHTML = chapters.get(n) || "";
+              html.push(`<section class="page" id="${code}-${n}">
+                <div class="hdr">
+                  <div class="corner"><a href="#toc">Home</a></div>
+                  <div class="book">${NAMES[code]||code} ${n}</div>
+                  <div class="corner"><a href="#grid-${code}">Chapters</a></div>
+                </div>
+                <div class="spread">
+                  <article class="left">${chapHTML}</article>
+                  <div class="divider"></div>
+                  <aside class="notes"> </aside>
+                </div>
+              </section>`);
+            }
+          }
+
+          html.push(`</body></html>`);
+          await fs.mkdir("out", {recursive:true});
+          await fs.writeFile("out/index.html", html.join("\n"));
+          console.log("Built out/index.html");
+          EOF
+
+      - name: Build HTML from fetch.bible
+        env:
+          BIBLE_ID: ${{ inputs.bible_id }}
+        run: |
+          node builder.mjs --bible="${{ inputs.bible_id }}" --books="${{ inputs.books }}" --theme="${{ inputs.theme }}" --pagesize="${{ inputs.pagesize }}"
+          test -f out/index.html && echo "HTML ready" || (echo "HTML missing" && exit 1)
+
+      - name: (Debug) Upload HTML preview
+        uses: actions/upload-artifact@v4
+        with:
+          name: html-preview
+          path: out/index.html
+
+      - name: Render PDF with WeasyPrint (anchors preserved)
+        run: |
+          weasyprint out/index.html out/journaling.pdf
+
+      - name: Upload finished PDF
+        uses: actions/upload-artifact@v4
+        with:
+          name: journaling-pdf
+          path: out/journaling.pdf
