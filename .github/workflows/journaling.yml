@@ -1,201 +1,138 @@
-name: Fetch(bible) → Journaling PDF (links preserved)
+name: EPUB to Journaling PDF (links preserved)
 
 on:
   workflow_dispatch:
     inputs:
-      bible_id:
-        description: "Bible ID (use eng_bsb for Berean Standard Bible)"
-        default: eng_bsb
+      epub_url:
+        description: "Direct URL to the EPUB (copy the EPUB link from Archive.org)"
         required: true
-      books:
-        description: "Optional comma list of book codes (e.g., gen,exo,psa). Leave blank for ALL."
-        required: false
-      theme:
-        description: "light or dark"
-        default: light
-      size:
-        description: "letter-landscape or a4-landscape"
-        default: letter-landscape
-      gutter_in:
-        description: "Width of the notes gutter (inches)"
-        default: "4.0"
+      right_margin_in:
+        description: "Right journal margin (inches)"
+        default: "3.0"
+        required: true
+      orientation:
+        description: "portrait or landscape"
+        default: "landscape"
+        required: true
+      paper_size:
+        description: "letter or a4"
+        default: "letter"
+        required: true
+      base_font_pt:
+        description: "Base font size (points)"
+        default: "11"
+        required: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Set up Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Write builder script (builder.mjs)
+      - name: Install Calibre (ebook-convert)
         run: |
-          cat > builder.mjs <<'JS'
-          import fs from "fs/promises";
+          sudo -v
+          curl -L https://download.calibre-ebook.com/linux-installer.py | sudo -E python3 -
 
-          const BIBLE = (process.env.BIBLE_ID || "eng_bsb").trim();
-          const BOOKS_INPUT = (process.env.BOOKS || "").trim();
-          const THEME = (process.env.THEME || "light").toLowerCase();
-          const SIZE = (process.env.SIZE || "letter-landscape");
-          const GUTTER = parseFloat(process.env.GUTTER_IN || "4.0");
-
-          // [code, name]
-          const BOOKS = [
-            ["gen","Genesis"],["exo","Exodus"],["lev","Leviticus"],["num","Numbers"],["deu","Deuteronomy"],
-            ["jos","Joshua"],["jdg","Judges"],["rut","Ruth"],["1sa","1 Samuel"],["2sa","2 Samuel"],
-            ["1ki","1 Kings"],["2ki","2 Kings"],["1ch","1 Chronicles"],["2ch","2 Chronicles"],
-            ["ezr","Ezra"],["neh","Nehemiah"],["est","Esther"],["job","Job"],["psa","Psalms"],
-            ["pro","Proverbs"],["ecc","Ecclesiastes"],["sng","Song of Songs"],["isa","Isaiah"],["jer","Jeremiah"],
-            ["lam","Lamentations"],["ezk","Ezekiel"],["dan","Daniel"],["hos","Hosea"],["jol","Joel"],["amo","Amos"],
-            ["oba","Obadiah"],["jon","Jonah"],["mic","Micah"],["nam","Nahum"],["hab","Habakkuk"],["zep","Zephaniah"],
-            ["hag","Haggai"],["zec","Zechariah"],["mal","Malachi"],["mat","Matthew"],["mrk","Mark"],["luk","Luke"],
-            ["jhn","John"],["act","Acts"],["rom","Romans"],["1co","1 Corinthians"],["2co","2 Corinthians"],
-            ["gal","Galatians"],["eph","Ephesians"],["php","Philippians"],["col","Colossians"],
-            ["1th","1 Thessalonians"],["2th","2 Thessalonians"],["1ti","1 Timothy"],["2ti","2 Timothy"],
-            ["tit","Titus"],["phm","Philemon"],["heb","Hebrews"],["jas","James"],["1pe","1 Peter"],
-            ["2pe","2 Peter"],["1jn","1 John"],["2jn","2 John"],["3jn","3 John"],["jud","Jude"],["rev","Revelation"],
-          ];
-
-          const PICK = BOOKS_INPUT
-            ? BOOKS_INPUT.split(",").map(s=>s.trim().toLowerCase()).filter(Boolean)
-            : BOOKS.map(([c])=>c);
-
-          async function fetchJSON(url) {
-            const r = await fetch(url);
-            if (!r.ok) throw new Error(`${r.status} ${r.statusText} for ${url}`);
-            return r.json();
-          }
-          const toArray = (x) =>
-            !x ? [] : Array.isArray(x) ? x : typeof x === "object" ? Object.values(x) : [];
-
-          function flattenHtmlFromChapter(ch) {
-            const parts = [];
-            if (ch.html) parts.push(ch.html);
-
-            const cont = ch.content ?? ch.blocks ?? ch.paragraphs ?? ch.children;
-            for (const it of toArray(cont)) {
-              if (typeof it === "string") parts.push(it);
-              else if (it.html) parts.push(it.html);
-              else if (it.t) parts.push(it.t);
-              else if (it.content) parts.push(it.content);
-            }
-
-            const fns = toArray(ch.footnotes);
-            if (fns.length) {
-              parts.push(`<h2 class="fn-heading">Footnotes</h2>`);
-              for (const fn of fns) {
-                const id = fn.id || fn.noteId || "";
-                const h = fn.html || fn.t || "";
-                parts.push(`<div class="footnote" id="${id}">${h}</div>`);
-              }
-            }
-            return parts.join("\n");
-          }
-
-          const css = `
-          @page { size: ${SIZE.replace("-", " ")}; margin: 0.5in ${GUTTER + 0.5}in 0.6in 0.7in; }
-          :root { --muted:#8a8a8a; --ink:${THEME==="dark"?"#eaeaea":"#111"}; --bg:${THEME==="dark"?"#111":"#fff"}; }
-          body { font-family: system-ui, -apple-system, "DejaVu Sans", Arial, sans-serif; color:var(--ink); background:var(--bg); line-height:1.45; }
-          .page { break-before: page; position: relative; }
-          .divider { position: fixed; top:0; bottom:0; right: ${GUTTER + 0.2}in; width:1px; background:#d0d0d0; }
-          .gutter { position: fixed; top:0; bottom:0; right:0; width: ${GUTTER}in; }
-          .page-header { position: running(pageHeader); display:flex; justify-content:space-between; font-size:9pt; color:var(--muted); }
-          .ph-left a, .ph-right a { color: var(--muted); text-decoration:none; }
-          @page { @top-center { content: element(pageHeader) } }
-          h1,h2,h3 { margin: 0.2in 0 0.08in; }
-          .book-title { font-size:18pt; font-weight:700; }
-          .chapter-title { font-size:14pt; font-weight:700; }
-          .grid { display:grid; grid-template-columns: repeat(14, 1fr); gap:4px; margin-top:8px; max-width: 9.5in; }
-          .grid a { text-decoration:none; color:inherit; border:1px solid #d0d0d0; border-radius:6px; font-size:9pt; padding:4px 0; text-align:center; }
-          .ch { margin-right: 0.15in; }
-          sup { font-size:65%; line-height:0; vertical-align:baseline; position:relative; top:-0.4em; }
-          a { color: inherit; }
-          .fn-heading { font-size:10pt; margin-top:0.2in; }
-          `;
-
-          function header(left, center, right) {
-            return `<div class="page-header"><div class="ph-left">${left||""}</div><div class="ph-center">${center||""}</div><div class="ph-right">${right||""}</div></div>`;
-          }
-
-          async function build() {
-            let html = `<!doctype html><html><head><meta charset="utf-8"><title>journaling</title><style>${css}</style></head><body>`;
-            html += `<div class="divider"></div><div class="gutter"></div>`;
-
-            // TOC
-            html += `<section id="toc" class="page">${header("", "<b>Holy Bible — Journaling Edition</b>", "")}
-                     <h1>Table of Contents</h1>
-                     <ul style="columns:3; -webkit-columns:3; column-gap:1.2rem; list-style:none; padding:0;">${
-                       BOOKS.filter(([c])=>PICK.includes(c))
-                            .map(([c,n])=>`<li style="margin:0 0 6px 0;"><a href="#book-${c}">${n}</a></li>`).join("")
-                     }</ul></section>`;
-
-            for (const [code,name] of BOOKS) {
-              if (!PICK.includes(code)) continue;
-
-              const url = `https://v1.fetch.bible/bibles/${BIBLE}/html/${code}.json`;
-              const data = await fetchJSON(url);
-
-              const chapters = Array.isArray(data) ? data
-                             : Array.isArray(data.chapters) ? data.chapters
-                             : (data.chapters && typeof data.chapters === "object") ? Object.values(data.chapters)
-                             : [];
-
-              // Book page (no NaN anywhere)
-              html += `<section id="book-${code}" class="page">
-                         ${header(`<a href="#toc">Home</a>`, `${name}`, `<a href="#grid-${code}">Chapters</a>`)}
-                         <h2 class="book-title">${name}</h2>
-                         <div id="grid-${code}" class="grid">${
-                           chapters.map((ch,i)=>`<a href="#${code}-${Number(ch.c||ch.chapter||ch.num||i+1)}">${i+1}</a>`).join("")
-                         }</div>
-                       </section>`;
-
-              // Chapter pages
-              for (let i=0; i<chapters.length; i++) {
-                const ch = chapters[i] || {};
-                const num = Number(ch.c || ch.chapter || ch.num || i+1);
-                const chapHTML = flattenHtmlFromChapter(ch);
-
-                html += `<section id="${code}-${num}" class="page">
-                           ${header(`<a href="#toc">Home</a>`, `${name} ${num}`, `<a href="#grid-${code}">Chapters</a>`)}
-                           <h3 class="chapter-title">${name} ${num}</h3>
-                           <div class="ch">${chapHTML}</div>
-                         </section>`;
-              }
-            }
-
-            html += `</body></html>`;
-            await fs.writeFile("out.html", html, "utf8");
-          }
-          await build();
-          JS
-
-      - name: Build HTML from fetch.bible
-        env:
-          BIBLE_ID: ${{ github.event.inputs.bible_id }}
-          BOOKS: ${{ github.event.inputs.books }}
-          THEME: ${{ github.event.inputs.theme }}
-          SIZE: ${{ github.event.inputs.size }}
-          GUTTER_IN: ${{ github.event.inputs.gutter_in }}
-        run: node builder.mjs
-
-      - name: Set up Python + deps for WeasyPrint
+      - name: Set up Python
         uses: actions/setup-python@v5
-        with: { python-version: '3.x' }
-      - run: |
-          sudo apt-get update
-          sudo apt-get install -y libcairo2 libpango-1.0-0 libgdk-pixbuf2.0-0 libffi-dev shared-mime-info fonts-dejavu
-          python -m pip install --upgrade pip
-          pip install weasyprint
+        with:
+          python-version: "3.x"
 
-      - name: Render PDF (anchors preserved)
-        run: weasyprint out.html journaling.pdf
+      - name: Python deps
+        run: pip install --quiet pymupdf
+
+      - name: Download EPUB
+        run: |
+          mkdir -p work
+          curl -L "${{ inputs.epub_url }}" -o work/book.epub
+          python - << 'PY'
+import zipfile, sys
+try:
+    zipfile.ZipFile("work/book.epub").testzip()
+    print("EPUB looks valid.")
+except Exception as e:
+    print("ERROR: URL did not return a valid EPUB/ZIP:", e)
+    sys.exit(1)
+PY
+
+      - name: Compute margins and paper
+        id: cfg
+        shell: bash
+        run: |
+          RIGHT_IN="${{ inputs.right_margin_in }}"
+          ORIENT="${{ inputs.orientation }}"
+          PAPER="${{ inputs.paper_size }}"
+          MPT=$(python3 -c 'import sys; print(int(float(sys.argv[1])*72))' "$RIGHT_IN")
+          # For landscape we put the journal space on the BOTTOM, then rotate pages,
+          # so it becomes the RIGHT margin visually.
+          if [ "$ORIENT" = "landscape" ]; then
+            MR=54
+            MB="$MPT"
+            ROTATE="yes"
+          else
+            MR="$MPT"
+            MB=54
+            ROTATE="no"
+          fi
+          echo "margin_right_pt=$MR" >> "$GITHUB_OUTPUT"
+          echo "margin_bottom_pt=$MB" >> "$GITHUB_OUTPUT"
+          echo "paper=$PAPER" >> "$GITHUB_OUTPUT"
+          echo "rotate=$ROTATE" >> "$GITHUB_OUTPUT"
+
+      - name: Convert EPUB to base PDF (Calibre keeps anchors)
+        run: |
+          ebook-convert work/book.epub work/base.pdf \
+            --paper-size "${{ steps.cfg.outputs.paper }}" \
+            --margin-left 54 --margin-top 54 \
+            --margin-right ${{ steps.cfg.outputs.margin_right_pt }} \
+            --margin-bottom ${{ steps.cfg.outputs.margin_bottom_pt }} \
+            --pdf-use-document-metadata \
+            --embed-all-fonts \
+            --pdf-add-toc \
+            --base-font-size ${{ inputs.base_font_pt }}
+          ls -lh work/base.pdf
+
+      - name: Add journal divider and Home hotspot (and rotate if needed)
+        env:
+          ROTATE: ${{ steps.cfg.outputs.rotate }}
+          RIGHT_IN: ${{ inputs.right_margin_in }}
+        run: |
+          python - << 'PY'
+import fitz, os
+in_pdf="work/base.pdf"
+out_pdf="work/journaling.pdf"
+right_in=float(os.getenv("RIGHT_IN","3.0"))
+rotate=(os.getenv("ROTATE","no").lower()=="yes")
+margin_pt=int(right_in*72)
+
+doc=fitz.open(in_pdf)
+
+# Rotate pages if requested (keeps links intact)
+if rotate:
+    for p in doc:
+        if p.rect.height > p.rect.width:
+            p.set_rotation(90)
+
+# Draw divider at the inner edge of the journal space and add an invisible "Home" hotspot
+for p in doc:
+    r=p.rect
+    x=r.x1 - margin_pt
+    # Divider line
+    p.draw_line(fitz.Point(x, r.y0+12), fitz.Point(x, r.y1-12), color=(0,0,0), width=0.5)
+    # "Home" label and hotspot back to page 1 (index 0)
+    p.insert_text(fitz.Point(r.x0+18, r.y0+22), "Home", fontsize=8, color=(0.3,0.3,0.3))
+    p.insert_link({"kind": fitz.LINK_GOTO, "from": fitz.Rect(r.x0+12, r.y0+10, r.x0+75, r.y0+28), "page": 0})
+
+doc.save(out_pdf)
+print("Wrote", out_pdf)
+PY
+          ls -lh work/journaling.pdf
 
       - name: Upload finished PDF
         uses: actions/upload-artifact@v4
         with:
-          name: journaling
-          path: journaling.pdf
+          name: journaling-pdf
+          path: work/journaling.pdf
+          if-no-files-found: error
