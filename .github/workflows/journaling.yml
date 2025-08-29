@@ -4,24 +4,24 @@ on:
   workflow_dispatch:
     inputs:
       epub_url:
-        description: "Direct URL to the EPUB (copy the EPUB link from Archive.org)"
+        description: "Direct URL to the EPUB (copy link from Archive.org's EPUB button)"
         required: true
       right_margin_in:
         description: "Right journal margin (inches)"
-        default: "3.0"
         required: true
+        default: "3.0"
       orientation:
         description: "portrait or landscape"
-        default: "landscape"
         required: true
+        default: "landscape"
       paper_size:
         description: "letter or a4"
+        required: true
         default: "letter"
-        required: true
       base_font_pt:
-        description: "Base font size (points)"
-        default: "11"
+        description: "Base font size in points"
         required: true
+        default: "11"
 
 jobs:
   build:
@@ -43,91 +43,92 @@ jobs:
       - name: Python deps
         run: pip install --quiet pymupdf
 
-      - name: Download EPUB
+      - name: Download EPUB and validate
         run: |
           mkdir -p work
           curl -L "${{ inputs.epub_url }}" -o work/book.epub
-          python - << 'PY'
-import zipfile, sys
+          python3 -c "import sys,zipfile; p='work/book.epub'; 
+import traceback
 try:
-    zipfile.ZipFile("work/book.epub").testzip()
-    print("EPUB looks valid.")
+    zipfile.ZipFile(p).testzip()
+    print('EPUB OK:', p)
 except Exception as e:
-    print("ERROR: URL did not return a valid EPUB/ZIP:", e)
-    sys.exit(1)
-PY
+    print('ERROR: not a valid EPUB/ZIP ->', e); sys.exit(1)"
 
-      - name: Compute margins and paper
+      - name: Compute margins and page options
         id: cfg
         shell: bash
         run: |
           RIGHT_IN="${{ inputs.right_margin_in }}"
           ORIENT="${{ inputs.orientation }}"
           PAPER="${{ inputs.paper_size }}"
-          MPT=$(python3 -c 'import sys; print(int(float(sys.argv[1])*72))' "$RIGHT_IN")
-          # For landscape we put the journal space on the BOTTOM, then rotate pages,
-          # so it becomes the RIGHT margin visually.
+
+          RIGHT_PT=$(python3 -c 'import sys; print(int(float(sys.argv[1])*72))' "$RIGHT_IN")
+
           if [ "$ORIENT" = "landscape" ]; then
-            MR=54
-            MB="$MPT"
-            ROTATE="yes"
+            # Put extra space at bottom, then we rotate pages (so it becomes right margin visually)
+            MARGIN_RIGHT=54
+            MARGIN_BOTTOM="$RIGHT_PT"
+            ROTATE=yes
           else
-            MR="$MPT"
-            MB=54
-            ROTATE="no"
+            MARGIN_RIGHT="$RIGHT_PT"
+            MARGIN_BOTTOM=54
+            ROTATE=no
           fi
-          echo "margin_right_pt=$MR" >> "$GITHUB_OUTPUT"
-          echo "margin_bottom_pt=$MB" >> "$GITHUB_OUTPUT"
+
           echo "paper=$PAPER" >> "$GITHUB_OUTPUT"
+          echo "margin_right=$MARGIN_RIGHT" >> "$GITHUB_OUTPUT"
+          echo "margin_bottom=$MARGIN_BOTTOM" >> "$GITHUB_OUTPUT"
           echo "rotate=$ROTATE" >> "$GITHUB_OUTPUT"
 
-      - name: Convert EPUB to base PDF (Calibre keeps anchors)
+      - name: Convert EPUB to PDF with Calibre (keeps anchors/TOC)
         run: |
           ebook-convert work/book.epub work/base.pdf \
             --paper-size "${{ steps.cfg.outputs.paper }}" \
             --margin-left 54 --margin-top 54 \
-            --margin-right ${{ steps.cfg.outputs.margin_right_pt }} \
-            --margin-bottom ${{ steps.cfg.outputs.margin_bottom_pt }} \
+            --margin-right ${{ steps.cfg.outputs.margin_right }} \
+            --margin-bottom ${{ steps.cfg.outputs.margin_bottom }} \
             --pdf-use-document-metadata \
             --embed-all-fonts \
             --pdf-add-toc \
             --base-font-size ${{ inputs.base_font_pt }}
           ls -lh work/base.pdf
 
-      - name: Add journal divider and Home hotspot (and rotate if needed)
+      - name: Add journaling divider + Home hotspot; rotate if needed
         env:
           ROTATE: ${{ steps.cfg.outputs.rotate }}
-          RIGHT_IN: ${{ inputs.right_margin_in }}
+          RIGHT_MARGIN_IN: ${{ inputs.right_margin_in }}
         run: |
-          python - << 'PY'
-import fitz, os
-in_pdf="work/base.pdf"
-out_pdf="work/journaling.pdf"
-right_in=float(os.getenv("RIGHT_IN","3.0"))
-rotate=(os.getenv("ROTATE","no").lower()=="yes")
-margin_pt=int(right_in*72)
+          mkdir -p work
+          cat > work/add_journal.py << 'PY'
+import os, fitz
+in_pdf = "work/base.pdf"
+out_pdf = "work/journaling.pdf"
+right_in = float(os.getenv("RIGHT_MARGIN_IN", "3.0"))
+rotate = os.getenv("ROTATE", "no").lower() == "yes"
+margin_pt = int(right_in * 72)
 
-doc=fitz.open(in_pdf)
+doc = fitz.open(in_pdf)
 
-# Rotate pages if requested (keeps links intact)
+# Rotate (landscape) while preserving links
 if rotate:
     for p in doc:
         if p.rect.height > p.rect.width:
             p.set_rotation(90)
 
-# Draw divider at the inner edge of the journal space and add an invisible "Home" hotspot
 for p in doc:
-    r=p.rect
-    x=r.x1 - margin_pt
+    r = p.rect
+    x = r.x1 - margin_pt
     # Divider line
     p.draw_line(fitz.Point(x, r.y0+12), fitz.Point(x, r.y1-12), color=(0,0,0), width=0.5)
-    # "Home" label and hotspot back to page 1 (index 0)
+    # Tiny "Home" label + hotspot back to page 1 (index 0). All existing links remain intact.
     p.insert_text(fitz.Point(r.x0+18, r.y0+22), "Home", fontsize=8, color=(0.3,0.3,0.3))
     p.insert_link({"kind": fitz.LINK_GOTO, "from": fitz.Rect(r.x0+12, r.y0+10, r.x0+75, r.y0+28), "page": 0})
 
 doc.save(out_pdf)
 print("Wrote", out_pdf)
 PY
+          python3 work/add_journal.py
           ls -lh work/journaling.pdf
 
       - name: Upload finished PDF
