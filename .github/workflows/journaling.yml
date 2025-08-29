@@ -1,11 +1,127 @@
-- name: Download EPUB and validate
-  run: |
-    mkdir -p work
-    curl -L "${{ inputs.epub_url }}" -o work/book.epub
-    python3 -c "import sys,zipfile; p='work/book.epub'; 
-import traceback
+name: epub_to_journaling_pdf
+
+on:
+  workflow_dispatch:
+    inputs:
+      epub_url:
+        description: Direct EPUB URL
+        required: true
+      right_margin_in:
+        description: Right margin inches
+        required: true
+        default: '3.0'
+      orientation:
+        description: portrait or landscape
+        required: true
+        default: landscape
+      paper_size:
+        description: letter or a4
+        required: true
+        default: letter
+      base_font_pt:
+        description: Base font points
+        required: true
+        default: '11'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Calibre (ebook-convert)
+        run: |
+          sudo -v
+          curl -L https://download.calibre-ebook.com/linux-installer.py | sudo -E python3 -
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install PyMuPDF
+        run: pip install --quiet pymupdf
+
+      - name: Download EPUB and validate
+        run: |
+          mkdir -p work
+          curl -L "${{ inputs.epub_url }}" -o work/book.epub
+          python3 - <<'PY'
+import sys, zipfile
+p = "work/book.epub"
 try:
     zipfile.ZipFile(p).testzip()
-    print('EPUB OK:', p)
+    print("EPUB OK:", p)
 except Exception as e:
-    print('ERROR: not a valid EPUB/ZIP ->', e); sys.exit(1)"
+    print("ERROR: not a valid EPUB/ZIP ->", e)
+    sys.exit(1)
+PY
+
+      - name: Compute margins and page options
+        id: cfg
+        shell: bash
+        run: |
+          RIGHT_IN="${{ inputs.right_margin_in }}"
+          ORIENT="${{ inputs.orientation }}"
+          PAPER="${{ inputs.paper_size }}"
+          RIGHT_PT=$(python3 -c 'import sys; print(int(float(sys.argv[1])*72))' "$RIGHT_IN")
+          if [ "$ORIENT" = "landscape" ]; then
+            MARGIN_RIGHT=54
+            MARGIN_BOTTOM="$RIGHT_PT"
+            ROTATE=yes
+          else
+            MARGIN_RIGHT="$RIGHT_PT"
+            MARGIN_BOTTOM=54
+            ROTATE=no
+          fi
+          echo "paper=$PAPER" >> "$GITHUB_OUTPUT"
+          echo "margin_right=$MARGIN_RIGHT" >> "$GITHUB_OUTPUT"
+          echo "margin_bottom=$MARGIN_BOTTOM" >> "$GITHUB_OUTPUT"
+          echo "rotate=$ROTATE" >> "$GITHUB_OUTPUT"
+
+      - name: Convert EPUB to PDF with Calibre
+        run: |
+          ebook-convert work/book.epub work/base.pdf \
+            --paper-size "${{ steps.cfg.outputs.paper }}" \
+            --margin-left 54 --margin-top 54 \
+            --margin-right ${{ steps.cfg.outputs.margin_right }} \
+            --margin-bottom ${{ steps.cfg.outputs.margin_bottom }} \
+            --pdf-use-document-metadata \
+            --embed-all-fonts \
+            --pdf-add-toc \
+            --base-font-size ${{ inputs.base_font_pt }}
+          ls -lh work/base.pdf
+
+      - name: Add journal divider and Home hotspot; rotate if needed
+        env:
+          ROTATE: ${{ steps.cfg.outputs.rotate }}
+          RIGHT_MARGIN_IN: ${{ inputs.right_margin_in }}
+        run: |
+          python3 - <<'PY'
+import os, fitz
+in_pdf = "work/base.pdf"
+out_pdf = "work/journaling.pdf"
+right_in = float(os.getenv("RIGHT_MARGIN_IN", "3.0"))
+rotate = os.getenv("ROTATE", "no").lower() == "yes"
+margin_pt = int(right_in * 72)
+doc = fitz.open(in_pdf)
+if rotate:
+    for p in doc:
+        if p.rect.height > p.rect.width:
+            p.set_rotation(90)
+for p in doc:
+    r = p.rect
+    x = r.x1 - margin_pt
+    p.draw_line(fitz.Point(x, r.y0+12), fitz.Point(x, r.y1-12), color=(0,0,0), width=0.5)
+    p.insert_text(fitz.Point(r.x0+18, r.y0+22), "Home", fontsize=8, color=(0.3,0.3,0.3))
+    p.insert_link({"kind": fitz.LINK_GOTO, "from": fitz.Rect(r.x0+12, r.y0+10, r.x0+75, r.y0+28), "page": 0})
+doc.save(out_pdf)
+print("Wrote", out_pdf)
+PY
+          ls -lh work/journaling.pdf
+
+      - name: Upload finished PDF
+        uses: actions/upload-artifact@v4
+        with:
+          name: journaling-pdf
+          path: work/journaling.pdf
